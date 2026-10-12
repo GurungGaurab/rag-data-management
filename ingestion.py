@@ -1,13 +1,9 @@
 from pathlib import Path 
-from docling.document_converter import DocumentConverter
-from docling_core.types.doc import ContentLayer
 
-menu_pdf = Path(__file__).parent /"data" /"raw"/ "handbook_2026.pdf"
+RUN_NAME = "rebuild_v1"
+RECIPE_DIR = Path("data/raw")
+OUT_DIR = Path("data/parsed") / RUN_NAME
 
-converter = DocumentConverter()
-result = converter.convert(menu_pdf, page_range=(24,26))
-doc = result.document
+print(OUT_DIR)
+print(sorted(RECIPE_DIR.glob("*.pdf")))
 
-print(doc.export_to_markdown(included_content_layers={
-    ContentLayer.BODY, ContentLayer.FURNITURE
-}))
