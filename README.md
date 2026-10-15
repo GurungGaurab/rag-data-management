@@ -1,0 +1,165 @@
+# RAG Data Management
+
+Research project on best practice for managing the data behind a RAG (retrieval-augmented generation) system: how to turn real-world PDFs into clean, structured, versioned text, and how to show that this makes answers more reliable.
+
+The project has four parts:
+
+| Part | Tool | Purpose |
+|---|---|---|
+| 1 | **Docling** | Turn PDFs into clean, structured text: tables, images, metadata, chunking |
+| 2 | PostgreSQL + pgvector | Store chunks with metadata so outdated editions can be marked superseded |
+| 3 | LlamaIndex | RAG framework that connects the parts |
+| 4 | Benchmarking | Show that parts 1–3 improve reliability and accuracy |
+
+This repository currently covers **part 1, the Docling stage**.
+
+**Corpus:** UOW Malaysia College Undergraduate Handbook, 2025 and 2026 editions (public documents, not included in the repo).
+
+---
+
+## Setup
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install docling==2.135.0 pypdfium2
+```
+
+Versions used for the results below: docling 2.135.0, docling-core 2.101.0, docling-parse 7.22.2, pypdfium2 5.14.0.
+
+Put the PDFs in `data/raw/`:
+
+```
+data/raw/handbook_2025.pdf
+data/raw/handbook_2026.pdf
+```
+
+`data/` is in `.gitignore`, so neither the PDFs nor the parsed output are committed.
+
+## Run
+
+```bash
+python pipeline.py
+```
+
+Output goes to `data/parsed/<RUN_NAME>/`:
+
+| File | Contents |
+|---|---|
+| `<file>.json` | Full DoclingDocument. This is the complete record and the input for chunking. |
+| `<file>.md` | Readable body text. Each picture is labelled `embedded image` or `drawn picture` instead of `<!-- image -->`. |
+| `<file>_p<N>_stored_<i>.png` | Each image stored inside the PDF, at its original resolution |
+| `manifest.json` | SHA-256 of each parsed file with its full result. Files already parsed are skipped. |
+| `report.json` | Settings, package versions and one record per PDF for this run |
+
+Change `RUN_NAME` whenever a setting changes, so runs can be compared and nothing is overwritten.
+
+---
+
+## Architecture
+
+![Docling stage architecture](architecture.png)
+
+<details>
+<summary>Mermaid source</summary>
+
+```mermaid
+flowchart TD
+    A["PDFs in data/raw<br/>2025 + 2026 handbooks"] --> B["Hash check<br/>SHA-256 of the file"]
+    B -- "already parsed" --> S["Skip"]
+    B -- "new or changed" --> C["Docling convert<br/>one converter · default backend (docling-parse)<br/>tables on · OCR off · keeps stored images"]
+    C -- error --> X["Recorded as failed<br/>run continues with next PDF"]
+
+    C --> D["DoclingDocument<br/>text, tables, headers/footers,<br/>layout-model pictures"]
+    C --> E["Stored images<br/>bitmap_resources, read from the file"]
+
+    D --> F["Text check<br/>% of PDF text layer read (vs pypdfium2)<br/>text inside images not counted"]
+    E --> G["Image detection<br/>image-only or mixed page · PNG saved"]
+    D --> H["Picture labels<br/>embedded image vs drawn picture"]
+    G --> H
+    G -.-> I["Gemini (planned)<br/>read text inside stored images"]
+
+    F --> O["Outputs, one folder per run<br/>JSON · labelled Markdown · PNGs<br/>report.json · manifest.json"]
+    H --> O
+    I -.-> O
+    O -.-> N["Next: chunking"]
+
+    classDef text fill:#e2f2ef,stroke:#0e6c61,color:#16212a
+    classDef img fill:#fbeadf,stroke:#b04e1d,color:#16212a
+    classDef plan fill:#ffffff,stroke:#7b8892,stroke-dasharray:5 4,color:#56646f
+    class D,F text
+    class E,G,H img
+    class I,N,S,X plan
+```
+
+</details>
+
+### Steps
+
+1. **Hash check.** Each PDF gets a SHA-256 fingerprint. If that exact file was already parsed in this run and its JSON still exists, it is skipped. The hash identifies the file; the "Updated as of" date identifies the edition.
+2. **Docling convert.** One converter per run. `generate_parsed_pages=True` and `include_bitmap_images=True` keep the list of images stored in the PDF, with their pixels. A PDF that fails is recorded with its error and the run continues.
+3. **Text check.** Every word Docling kept (text, list markers, table cells, headers and footers) is compared with the PDF's text layer, read separately with pypdfium2. Gives a percentage and flags pages where more than 5% (and at least 3 words) are missing. Text inside images is not in the text layer, so it is not counted.
+4. **Image detection.** For each image stored in the PDF: page, position, share of the page, pixel size, and page type (`image_only` if the image covers more than 30% of the page and the page has fewer than 30 body words, otherwise `mixed`). Each image is saved as a PNG.
+5. **Picture labels.** Docling's layout model also marks areas that look like pictures. A picture that sits inside a stored image is labelled `embedded image`; anything else is labelled `drawn picture`.
+6. **Gemini (planned).** `read_image_with_gemini()` is an empty placeholder for reading the text inside stored images.
+7. **Outputs.** Written to the run folder (see above).
+
+### Settings
+
+| Setting | Value | Why |
+|---|---|---|
+| PDF backend | docling-parse (default) | The only backend that returns stored images (`bitmap_resources`). The pypdfium2 backend returned none. |
+| OCR | off | The handbooks have a text layer |
+| Table structure | on, `ACCURATE` | Docling default |
+| `generate_parsed_pages` | `True` | Keeps the stored-image list after parsing |
+| `include_bitmap_images` | `True` | Decodes the stored images' pixels, not just their positions |
+| Text-check reference | pypdfium2 text layer | Independent of the backend used for parsing |
+
+---
+
+## Results (run `pipeline_v1`, 15 Oct 2026)
+
+| | 2025 handbook | 2026 handbook |
+|---|---|---|
+| Pages | 56 | 55 |
+| Parse time | 15.3 s | 11.5 s |
+| Text layer read | **99.89%** (18 of 16,524 words missing) | **99.66%** (57 of 16,590 words missing) |
+| Flagged pages | none | none |
+| Images stored in the PDF | 3 | 3 |
+| p. 6 | mixed, 1378×903 px, 27% of page | mixed, 1378×903 px, 27% of page |
+| pp. 7–8 | image-only, 1831×1294 px, 51% of page | image-only, 1831×1294 px, 51% of page |
+| Layout-model pictures | 12 (8 embedded, 4 drawn) | 7 (3 embedded, 4 drawn) |
+| Updated as of | 2025-01-22 | 2026-05-13 (cover); footers say 2026-01-10 |
+
+## Findings
+
+**Docling can tell which images are stored in the PDF.** Read from the file (`bitmap_resources`, or the native pipeline), it finds exactly 3 stored images per edition on pp. 6, 7 and 8, with the same pages and pixel sizes as `pdfimages`. This does not depend on any AI model.
+
+**It does not read the text inside them.** p. 6 (Graduate Attributes) has about 250 words that exist only inside its image. pp. 7–8 (academic calendar) are images with no text layer. Default settings return nothing for either. Earlier tests with OCR and local vision models on pp. 7–8 were mixed: built-in OCR, Granite and GLM-OCR returned nothing; LightOnOCR returned text that has not been checked yet.
+
+**The layout model's "pictures" are a different thing.** It also marks the four drawn logos on the cover, which are not stored images. On 2025 p. 6 it sometimes splits the single stored image into 6 small icons and sometimes keeps it as 1 picture, with the same Docling version and settings. So embedded-image detection is based on the stored-image list, not on the layout model.
+
+**The JSON keeps more than the Markdown.** Against an independent reference (`pdftotext`), the JSON keeps about 99.9% of the text layer and the default Markdown export about 95.6%. The difference is mostly headers and footers, which the Markdown export leaves out by default, and which is where most "Updated as of" dates are. Chunking should read the JSON.
+
+**Text that crosses a page break is kept together.** The "Retake" paragraph runs from p. 28 to p. 29. Docling stores it as one item with two page references. Code that only reads `prov[0]` counts it all on p. 28.
+
+**Backends are almost equal on text.** docling-parse and pypdfium2 both read 99.89% of the 2025 text layer. On 2026, pypdfium2 does slightly better (99.77% vs 99.55%) because docling-parse splits more superscripts (`10th` → `10` + `th`). docling-parse is still used because it is the only one that returns stored images.
+
+## Known gaps
+
+- Text inside images (p. 6, pp. 7–8) is not read. pp. 7–8 are recorded as a known gap.
+- Graphics drawn with lines and shapes are not stored images, so they are not detected as embedded images. Their text labels are usually still extracted as normal text.
+- Running the script again with nothing new overwrites `report.json` with "skipped" entries. The full results stay in `manifest.json`.
+
+## Notes for docling-serve (n8n)
+
+- Request JSON output, not only Markdown.
+- Use the default PDF backend.
+- Still to check: whether docling-serve can return the stored images and their positions, and which backends it offers.
+
+## Next steps
+
+- Decide whether "embedded images" means every stored image or only ones that carry information.
+- Try Gemini on the stored p. 6 image and compare its output word by word with the page.
+- Decide which date counts as an edition's version (cover or footer).
+- Chunking, including Gemini's 2,048-token embedding limit.
