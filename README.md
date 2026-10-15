@@ -54,7 +54,9 @@ Output goes to `data/parsed/<RUN_NAME>/`:
 
 Change `RUN_NAME` whenever a setting changes, so runs can be compared and nothing is overwritten.
 
-To read the text inside images with Apple's OCR (macOS only), set `DO_OCR = True` and use a new `RUN_NAME`. The OCR only runs on areas with no PDF text, so the normal text is not affected.
+To read the text inside images with Apple's OCR (macOS only), set `DO_OCR = True` and use a new `RUN_NAME`. Docling runs OCR on layout regions that have no PDF text or that contain an image or drawn shape; where PDF text and OCR text overlap, the PDF text is kept. In our test runs, none of the normal text changed.
+
+Note that Docling's own default is OCR **on** (`do_ocr=True`); this pipeline turns it off unless `DO_OCR = True`.
 
 `p6_readers.py` is the test behind the OCR findings below. It runs page 6 of both handbooks through Docling's built-in readers (ocrmac, ocrmac on the full page, and the SmolVLM picture describer) and writes what each one read to `data/parsed/p6_readers.txt`.
 
@@ -115,7 +117,7 @@ flowchart TD
 | Setting | Value | Why |
 |---|---|---|
 | PDF backend | docling-parse (default) | The only backend that returns stored images (`bitmap_resources`). The pypdfium2 backend returned none. |
-| OCR | off by default; `DO_OCR = True` uses ocrmac | The handbooks have a text layer. OCR is only needed for text inside images. ocrmac is Apple's OCR and runs on macOS only. |
+| OCR | off in this pipeline (Docling's own default is on); `DO_OCR = True` uses ocrmac | The test PDFs have a text layer. OCR is only needed for text inside images. ocrmac is Apple's OCR and runs on macOS only. |
 | Table structure | on, `ACCURATE` | Docling default |
 | `generate_parsed_pages` | `True` | Keeps the stored-image list after parsing |
 | `include_bitmap_images` | `True` | Decodes the stored images' pixels, not just their positions |
@@ -152,11 +154,13 @@ flowchart TD
 
 | Reader | Result | Reaches the chunks |
 |---|---|---|
-| Default settings | Nothing read | — |
-| ocrmac (Apple OCR) | All ~208 words, headings and bullets in order, 1 error ("Bea" for "Be a") | 2025: ~190 words; 2026: 1 word |
+| OCR off | Nothing read | — |
+| ocrmac (Apple OCR) | All ~208 words, headings and bullets in order, 1 error ("Bea" for "Be a") | 2025: ~190 words; 2026: essentially none |
 | ocrmac, full page | Same as above | Same as above |
 | SmolVLM (picture describer) | 2025: described the icons only. 2026: 13 of 20 bullets, all under one heading, reworded, one invented line | Yes |
 | RapidOCR | Crashed Python on macOS (segmentation fault in its image-resize step) | — |
+
+`p6_readers.py` counts "words from the image" as words Docling has for the page minus the words in the PDF's text layer. A few ordinary words also end up in that count because Docling and pypdfium2 split them differently (for example `fast-growing` → `fastgrowing`, `10km` → `10` + `th`), so the counts are slightly high. The ~208 figure was checked by counting the image section of the OCR output directly.
 
 ### OCR confidence (`ocr_confidence_test.py`)
 
@@ -170,15 +174,15 @@ flowchart TD
 
 **Docling can tell which images are stored in the PDF.** Read from the file (`bitmap_resources`, or the native pipeline), it finds exactly 3 stored images per edition on pp. 6, 7 and 8, with the same pages and pixel sizes as `pdfimages`. This does not depend on any AI model.
 
-**With default settings it does not read the text inside them.** p. 6 (Graduate Attributes) has about 208 words that exist only inside its image. pp. 7–8 (academic calendar) are images with no text layer.
+**With OCR off it does not read the text inside them.** p. 6 (Graduate Attributes) has about 208 words that exist only inside its image. pp. 7–8 (academic calendar) are images with no text layer.
 
 **Its built-in OCR can read them, at least on macOS.** With ocrmac (Apple's OCR), Docling read the p. 6 image text almost perfectly in both editions: about 208 words, headings and bullet points in order, one error. Running OCR on the whole file changed none of the normal text. The academic calendar stays unreadable even with ocrmac, and the cover logos add some junk. An earlier OCR run with a different engine on pp. 7–8 also produced mostly noise. Granite and GLM-OCR returned nothing there; LightOnOCR returned text that has not been checked yet.
 
-**But Docling stores OCR text inside the picture.** Its standard exports (Markdown, and the default chunker) skip picture contents, so in 2026 only 1 of the 208 words reaches the chunks. In 2025 about 190 words get through, but only because the layout model split the image into small icons and the text ended up outside them. The text has to be moved out of the picture, or into the picture's description, which does reach the chunks. This is left for the chunking stage.
+**But Docling stores OCR text inside the picture.** Its standard exports (Markdown, and the default chunker) skip picture contents, so in 2026 essentially none of the 208 words reaches the chunks (the test counted 1, most likely one of the ordinary words described above). In 2025 about 190 words get through, but only because the layout model split the image into small icons and the text ended up outside them. The text has to be moved out of the picture, or into the picture's description, which does reach the chunks. This is left for the chunking stage.
 
 **OCR confidence is a useful first filter, but not enough on its own.** Docling keeps a confidence score per OCR line (`result.pages[...].parsed_page.textline_cells`) and an average per page (`result.confidence.pages[n].ocr_score`). On the test PDFs, the well-read image scored 1.00 and the badly read ones scored lower, so a cut-off around 0.95 separated them. But some clearly wrong lines still scored 1.00, and ocrmac's scores are coarse (0.3 / 0.5 / 1.0), so the cut-off is not proven beyond these PDFs. A second check, such as whether the OCR words are real words, is needed. The scores are not saved in the JSON, and docling-serve only returns one OCR score for the whole document.
 
-**Whether an image can be read depends on the image, not the page.** OCR runs on each image area separately, so a dense table-like image fails the same way whether or not the page also has normal text. Quality should be judged per image, not by page type.
+**Whether an image can be read probably depends on the image, not the page (not yet tested).** OCR runs on layout regions rather than whole pages, so a dense table-like image would likely fail the same way whether or not the page also has normal text. This has not been tested with the same image in a different page context. If it holds, quality should be judged per image rather than by page type.
 
 **Its built-in picture describer is not reliable.** SmolVLM's output reaches the chunks, but on 2026 p. 6 it kept 13 of 20 bullet points, put them all under one heading, reworded several and added a line that is not in the image. On 2025 it only described the icons.
 
@@ -198,6 +202,10 @@ flowchart TD
 - With OCR on, the image-only rule counts OCR text as page text, so pp. 7–8 can be wrongly labelled `mixed`. The rule should count only the PDF's own text layer.
 - Graphics drawn with lines and shapes are not stored images, so they are not detected as embedded images. Their text labels are usually still extracted as normal text.
 - Running the script again with nothing new overwrites `report.json` with "skipped" entries. The full results stay in `manifest.json`.
+- If a PDF is replaced by a changed file with the same name, the old hash stays in `manifest.json` and points to the new output. Restoring the old file would then be wrongly skipped. To be fixed.
+- A picture is labelled `drawn picture` whenever it does not match a stored image. That does not prove it is drawn (for example, a picture spanning two stored images). It should be labelled "not matched" instead. To be fixed.
+- Setting `PAGE_RANGE` beyond the last page makes the text check fail. To be fixed.
+- `p6_readers.py` expects `data/parsed/` to exist; run `pipeline.py` once first.
 
 ## Notes for docling-serve (n8n)
 
