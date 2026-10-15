@@ -278,7 +278,7 @@ def process_pdf(converter, pdf, manifest):
     images = embedded_images(result, stem)
     labels = picture_labels(doc, images)
     md, labels_applied = labelled_markdown(doc, labels)
-    (OUT_DIR / f"{stem}.md").write_text(md, encoding="utf-8") 
+    (OUT_DIR / f"{stem}.md").write_text(md, encoding="utf-8") #d
 
     return {
         "file": pdf.name,

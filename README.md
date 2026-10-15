@@ -22,10 +22,10 @@ This repository currently covers **part 1, the Docling stage**.
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install docling==2.135.0 pypdfium2
+pip install -r requirements.txt
 ```
 
-Versions used for the results below: docling 2.135.0, docling-core 2.101.0, docling-parse 7.22.2, pypdfium2 5.14.0.
+Versions used for the results below: docling 2.135.0, docling-core 2.101.0, docling-parse 7.22.2, pypdfium2 5.14.0, ocrmac 1.0.1 (macOS only, used for the OCR tests).
 
 Put the PDFs in `data/raw/`:
 
@@ -53,6 +53,10 @@ Output goes to `data/parsed/<RUN_NAME>/`:
 | `report.json` | Settings, package versions and one record per PDF for this run |
 
 Change `RUN_NAME` whenever a setting changes, so runs can be compared and nothing is overwritten.
+
+To read the text inside images with Apple's OCR (macOS only), set `DO_OCR = True` and use a new `RUN_NAME`. The OCR only runs on areas with no PDF text, so the normal text is not affected.
+
+`p6_readers.py` is the test behind the OCR findings below. It runs page 6 of both handbooks through Docling's built-in readers (ocrmac, ocrmac on the full page, and the SmolVLM picture describer) and writes what each one read to `data/parsed/p6_readers.txt`.
 
 ---
 
@@ -109,7 +113,7 @@ flowchart TD
 | Setting | Value | Why |
 |---|---|---|
 | PDF backend | docling-parse (default) | The only backend that returns stored images (`bitmap_resources`). The pypdfium2 backend returned none. |
-| OCR | off | The handbooks have a text layer |
+| OCR | off by default; `DO_OCR = True` uses ocrmac | The handbooks have a text layer. OCR is only needed for text inside images. ocrmac is Apple's OCR and runs on macOS only. |
 | Table structure | on, `ACCURATE` | Docling default |
 | `generate_parsed_pages` | `True` | Keeps the stored-image list after parsing |
 | `include_bitmap_images` | `True` | Decodes the stored images' pixels, not just their positions |
@@ -131,11 +135,38 @@ flowchart TD
 | Layout-model pictures | 12 (8 embedded, 4 drawn) | 7 (3 embedded, 4 drawn) |
 | Updated as of | 2025-01-22 | 2026-05-13 (cover); footers say 2026-01-10 |
 
+### With OCR on (run `pipeline_v2_ocrmac`, ocrmac)
+
+| | 2025 handbook | 2026 handbook |
+|---|---|---|
+| Text layer read | 99.89% (unchanged) | 99.66% (unchanged) |
+| Normal text lost | 0 words on every page | 0 words on every page |
+| Words added on p. 6 (Graduate Attributes image) | 208, accurate | 208, accurate |
+| Words added on p. 1 (cover logos) | 15: logo text plus junk such as `₴18,88` | 14: logo text plus junk |
+| Words added on pp. 7–8 (academic calendar) | 47 and 51, mostly garbage | 46 and 27, mostly garbage |
+| Words added on any other page | 0 | 0 |
+
+### Built-in readers on p. 6 (`p6_readers.py`)
+
+| Reader | Result | Reaches the chunks |
+|---|---|---|
+| Default settings | Nothing read | — |
+| ocrmac (Apple OCR) | All ~208 words, headings and bullets in order, 1 error ("Bea" for "Be a") | 2025: ~190 words; 2026: 1 word |
+| ocrmac, full page | Same as above | Same as above |
+| SmolVLM (picture describer) | 2025: described the icons only. 2026: 13 of 20 bullets, all under one heading, reworded, one invented line | Yes |
+| RapidOCR | Crashed Python on macOS (segmentation fault in its image-resize step) | — |
+
 ## Findings
 
 **Docling can tell which images are stored in the PDF.** Read from the file (`bitmap_resources`, or the native pipeline), it finds exactly 3 stored images per edition on pp. 6, 7 and 8, with the same pages and pixel sizes as `pdfimages`. This does not depend on any AI model.
 
-**It does not read the text inside them.** p. 6 (Graduate Attributes) has about 250 words that exist only inside its image. pp. 7–8 (academic calendar) are images with no text layer. Default settings return nothing for either. Earlier tests with OCR and local vision models on pp. 7–8 were mixed: built-in OCR, Granite and GLM-OCR returned nothing; LightOnOCR returned text that has not been checked yet.
+**With default settings it does not read the text inside them.** p. 6 (Graduate Attributes) has about 208 words that exist only inside its image. pp. 7–8 (academic calendar) are images with no text layer.
+
+**Its built-in OCR can read them, at least on macOS.** With ocrmac (Apple's OCR), Docling read the p. 6 image text almost perfectly in both editions: about 208 words, headings and bullet points in order, one error. Running OCR on the whole file changed none of the normal text. The academic calendar stays unreadable even with ocrmac, and the cover logos add some junk. An earlier OCR run with a different engine on pp. 7–8 also produced mostly noise. Granite and GLM-OCR returned nothing there; LightOnOCR returned text that has not been checked yet.
+
+**But Docling stores OCR text inside the picture.** Its standard exports (Markdown, and the default chunker) skip picture contents, so in 2026 only 1 of the 208 words reaches the chunks. In 2025 about 190 words get through, but only because the layout model split the image into small icons and the text ended up outside them. The text has to be moved out of the picture, or into the picture's description, which does reach the chunks. This is left for the chunking stage.
+
+**Its built-in picture describer is not reliable.** SmolVLM's output reaches the chunks, but on 2026 p. 6 it kept 13 of 20 bullet points, put them all under one heading, reworded several and added a line that is not in the image. On 2025 it only described the icons.
 
 **The layout model's "pictures" are a different thing.** It also marks the four drawn logos on the cover, which are not stored images. On 2025 p. 6 it sometimes splits the single stored image into 6 small icons and sometimes keeps it as 1 picture, with the same Docling version and settings. So embedded-image detection is based on the stored-image list, not on the layout model.
 
@@ -147,7 +178,10 @@ flowchart TD
 
 ## Known gaps
 
-- Text inside images (p. 6, pp. 7–8) is not read. pp. 7–8 are recorded as a known gap.
+- Image-only pages (the academic calendar, pp. 7–8) are not handled. They are detected and recorded as a known gap.
+- OCR text from images is stored inside the picture and does not reach the chunks yet.
+- ocrmac only runs on macOS. OCR on Linux (for docling-serve on the server) is untested; RapidOCR crashed on macOS.
+- With OCR on, the image-only rule counts OCR text as page text, so pp. 7–8 can be wrongly labelled `mixed`. The rule should count only the PDF's own text layer.
 - Graphics drawn with lines and shapes are not stored images, so they are not detected as embedded images. Their text labels are usually still extracted as normal text.
 - Running the script again with nothing new overwrites `report.json` with "skipped" entries. The full results stay in `manifest.json`.
 
@@ -159,7 +193,9 @@ flowchart TD
 
 ## Next steps
 
+- Test an OCR engine on Linux, where docling-serve will run.
+- Try Gemini on the stored p. 6 image and compare it with the OCR text, as a comparison and as the fallback where OCR is not available.
+- Fix the image-only rule so it counts only the PDF's own text layer.
 - Decide whether "embedded images" means every stored image or only ones that carry information.
-- Try Gemini on the stored p. 6 image and compare its output word by word with the page.
 - Decide which date counts as an edition's version (cover or footer).
-- Chunking, including Gemini's 2,048-token embedding limit.
+- Chunking: move OCR text out of the picture (preferred: copy it into the picture's description, only for mixed pages, so calendar and logo junk stay out), and handle Gemini's 2,048-token embedding limit.
