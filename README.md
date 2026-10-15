@@ -69,22 +69,24 @@ To read the text inside images with Apple's OCR (macOS only), set `DO_OCR = True
 
 ```mermaid
 flowchart TD
-    A["PDFs in data/raw<br/>2025 + 2026 handbooks"] --> B["Hash check<br/>SHA-256 of the file"]
+    A["PDFs in data/raw"] --> B["Hash check<br/>SHA-256 of the file"]
     B -- "already parsed" --> S["Skip"]
-    B -- "new or changed" --> C["Docling convert<br/>one converter · default backend (docling-parse)<br/>tables on · OCR off · keeps stored images"]
-    C -- error --> X["Recorded as failed<br/>run continues with next PDF"]
+    B -- "new or changed" --> C["Docling convert<br/>one converter · default backend<br/>tables on · OCR optional (ocrmac, Mac only)"]
+    C -- error --> X["Recorded as failed<br/>run continues"]
 
-    C --> D["DoclingDocument<br/>text, tables, headers/footers,<br/>layout-model pictures"]
+    C --> D["DoclingDocument<br/>text, tables, headers/footers"]
     C --> E["Stored images<br/>bitmap_resources, read from the file"]
 
-    D --> F["Text check<br/>% of PDF text layer read (vs pypdfium2)<br/>text inside images not counted"]
-    E --> G["Image detection<br/>image-only or mixed page · PNG saved"]
-    D --> H["Picture labels<br/>embedded image vs drawn picture"]
-    G --> H
-    G -.-> I["Gemini (planned)<br/>read text inside stored images"]
+    D --> F["Text check<br/>% of PDF text layer read<br/>image text not counted"]
+    E --> G["Image detection<br/>PNG saved · labelled embedded or drawn"]
+
+    G -.-> Q["OCR quality check, per image<br/>confidence ≥ 0.95 + real-word check"]
+    Q -. good .-> K["Keep OCR text<br/>move it out of the picture"]
+    Q -. poor .-> I["Gemini + human check"]
 
     F --> O["Outputs, one folder per run<br/>JSON · labelled Markdown · PNGs<br/>report.json · manifest.json"]
-    H --> O
+    G --> O
+    K -.-> O
     I -.-> O
     O -.-> N["Next: chunking"]
 
@@ -92,8 +94,8 @@ flowchart TD
     classDef img fill:#fbeadf,stroke:#b04e1d,color:#16212a
     classDef plan fill:#ffffff,stroke:#7b8892,stroke-dasharray:5 4,color:#56646f
     class D,F text
-    class E,G,H img
-    class I,N,S,X plan
+    class E,G img
+    class Q,K,I,N,S,X plan
 ```
 
 </details>
@@ -105,7 +107,7 @@ flowchart TD
 3. **Text check.** Every word Docling kept (text, list markers, table cells, headers and footers) is compared with the PDF's text layer, read separately with pypdfium2. Gives a percentage and flags pages where more than 5% (and at least 3 words) are missing. Text inside images is not in the text layer, so it is not counted.
 4. **Image detection.** For each image stored in the PDF: page, position, share of the page, pixel size, and page type (`image_only` if the image covers more than 30% of the page and the page has fewer than 30 body words, otherwise `mixed`). Each image is saved as a PNG.
 5. **Picture labels.** Docling's layout model also marks areas that look like pictures. A picture that sits inside a stored image is labelled `embedded image`; anything else is labelled `drawn picture`.
-6. **Gemini (planned).** `read_image_with_gemini()` is an empty placeholder for reading the text inside stored images.
+6. **OCR quality check and Gemini (planned).** With OCR on, each image's OCR text would be checked (confidence of at least 0.95 plus a real-word check). Good text is kept and moved out of the picture; poor text goes to Gemini with a human check. `read_image_with_gemini()` is an empty placeholder for that step.
 7. **Outputs.** Written to the run folder (see above).
 
 ### Settings
@@ -156,6 +158,14 @@ flowchart TD
 | SmolVLM (picture describer) | 2025: described the icons only. 2026: 13 of 20 bullets, all under one heading, reworded, one invented line | Yes |
 | RapidOCR | Crashed Python on macOS (segmentation fault in its image-resize step) | — |
 
+### OCR confidence (`ocr_confidence_test.py`)
+
+| Image type (test PDFs) | OCR confidence, page average |
+|---|---|
+| Text-based image (Graduate Attributes) | 1.00, every line, both editions |
+| Logos | 0.90–0.91 (real logo text 1.00, junk lines 0.30) |
+| Dense, table-like image (academic calendar) | 0.63–0.86 |
+
 ## Findings
 
 **Docling can tell which images are stored in the PDF.** Read from the file (`bitmap_resources`, or the native pipeline), it finds exactly 3 stored images per edition on pp. 6, 7 and 8, with the same pages and pixel sizes as `pdfimages`. This does not depend on any AI model.
@@ -165,6 +175,10 @@ flowchart TD
 **Its built-in OCR can read them, at least on macOS.** With ocrmac (Apple's OCR), Docling read the p. 6 image text almost perfectly in both editions: about 208 words, headings and bullet points in order, one error. Running OCR on the whole file changed none of the normal text. The academic calendar stays unreadable even with ocrmac, and the cover logos add some junk. An earlier OCR run with a different engine on pp. 7–8 also produced mostly noise. Granite and GLM-OCR returned nothing there; LightOnOCR returned text that has not been checked yet.
 
 **But Docling stores OCR text inside the picture.** Its standard exports (Markdown, and the default chunker) skip picture contents, so in 2026 only 1 of the 208 words reaches the chunks. In 2025 about 190 words get through, but only because the layout model split the image into small icons and the text ended up outside them. The text has to be moved out of the picture, or into the picture's description, which does reach the chunks. This is left for the chunking stage.
+
+**OCR confidence is a useful first filter, but not enough on its own.** Docling keeps a confidence score per OCR line (`result.pages[...].parsed_page.textline_cells`) and an average per page (`result.confidence.pages[n].ocr_score`). On the test PDFs, the well-read image scored 1.00 and the badly read ones scored lower, so a cut-off around 0.95 separated them. But some clearly wrong lines still scored 1.00, and ocrmac's scores are coarse (0.3 / 0.5 / 1.0), so the cut-off is not proven beyond these PDFs. A second check, such as whether the OCR words are real words, is needed. The scores are not saved in the JSON, and docling-serve only returns one OCR score for the whole document.
+
+**Whether an image can be read depends on the image, not the page.** OCR runs on each image area separately, so a dense table-like image fails the same way whether or not the page also has normal text. Quality should be judged per image, not by page type.
 
 **Its built-in picture describer is not reliable.** SmolVLM's output reaches the chunks, but on 2026 p. 6 it kept 13 of 20 bullet points, put them all under one heading, reworded several and added a line that is not in the image. On 2025 it only described the icons.
 
@@ -194,6 +208,8 @@ flowchart TD
 ## Next steps
 
 - Test an OCR engine on Linux, where docling-serve will run.
+- Add a real-word check next to OCR confidence, and record confidence per image in `report.json`.
+- Route only images that fail these checks to Gemini, with a human check.
 - Try Gemini on the stored p. 6 image and compare it with the OCR text, as a comparison and as the fallback where OCR is not available.
 - Fix the image-only rule so it counts only the PDF's own text layer.
 - Decide whether "embedded images" means every stored image or only ones that carry information.
