@@ -42,13 +42,14 @@ data/raw/handbook_2026.pdf
 python pipeline.py
 ```
 
-Output goes to `data/parsed/<RUN_NAME>/`:
+Output goes to `data/parsed/<RUN_NAME>/`. Each output name is the PDF's file name plus the first 8 characters of its SHA-256 hash (for example `handbook_2026_3a4c58cf.json`), so a changed file with the same name gets its own outputs instead of overwriting the old ones.
 
 | File | Contents |
 |---|---|
-| `<file>.json` | Full DoclingDocument. This is the complete record and the input for chunking. |
-| `<file>.md` | Readable body text. Each picture is labelled `embedded image` or `drawn picture` instead of `<!-- image -->`. |
-| `<file>_p<N>_stored_<i>.png` | Each image stored inside the PDF, at its original resolution |
+| `<name>.json` | Full DoclingDocument. This is the complete record and the input for chunking. |
+| `<name>.md` | Readable body text. Each picture is labelled `embedded image` (with whether its text was read) or `picture not matched` instead of `<!-- image -->`. |
+| `<name>_p<N>_stored_<i>.png` | Each image stored inside the PDF, at its original resolution |
+| `<name>_p<N>_stored_<i>.txt` | The text read from that image, by OCR or Gemini (only when it was read) |
 | `manifest.json` | SHA-256 of each parsed file with its full result. Files already parsed are skipped. |
 | `report.json` | Settings, package versions and one record per PDF for this run |
 
@@ -57,6 +58,8 @@ Change `RUN_NAME` whenever a setting changes, so runs can be compared and nothin
 To read the text inside images with Apple's OCR (macOS only), set `DO_OCR = True` and use a new `RUN_NAME`. Docling runs OCR on layout regions that have no PDF text or that contain an image or drawn shape; where PDF text and OCR text overlap, the PDF text is kept. In our test runs, none of the normal text changed.
 
 Note that Docling's own default is OCR **on** (`do_ocr=True`); this pipeline turns it off unless `DO_OCR = True`.
+
+To send images whose OCR looks poor to Gemini, set `USE_GEMINI = True` and add your key to a `.env` file in the repo folder (`GEMINI_API_KEY=...`; `.env` is in `.gitignore`). The model is set in `GEMINI_MODEL`; use a free Flash model listed in Google AI Studio. The Gemini API is not available in every region (for example Hong Kong).
 
 `p6_readers.py` is the test behind the OCR findings below. It runs page 6 of both handbooks through Docling's built-in readers (ocrmac, ocrmac on the full page, and the SmolVLM picture describer) and writes what each one read to `data/parsed/p6_readers.txt`.
 
@@ -80,24 +83,24 @@ flowchart TD
     C --> E["Stored images<br/>bitmap_resources, read from the file"]
 
     D --> F["Text check<br/>% of PDF text layer read<br/>image text not counted"]
-    E --> G["Image detection<br/>PNG saved · labelled embedded or drawn"]
+    E --> G["Image detection<br/>PNG saved · labelled embedded or not matched"]
 
-    G -.-> Q["OCR quality check, per image<br/>confidence ≥ 0.95 + real-word check"]
-    Q -. good .-> K["Keep OCR text<br/>move it out of the picture"]
-    Q -. poor .-> I["Gemini + human check"]
+    G --> Q["OCR quality check, per image<br/>confidence ≥ 0.95 + real words ≥ 95%"]
+    Q -- good --> K["Keep OCR text<br/>saved as .txt per image"]
+    Q -- poor --> I["Gemini<br/>general prompt · retry if busy"]
 
     F --> O["Outputs, one folder per run<br/>JSON · labelled Markdown · PNGs<br/>report.json · manifest.json"]
     G --> O
-    K -.-> O
-    I -.-> O
+    K --> O
+    I --> O
     O -.-> N["Next: chunking"]
 
     classDef text fill:#e2f2ef,stroke:#0e6c61,color:#16212a
     classDef img fill:#fbeadf,stroke:#b04e1d,color:#16212a
     classDef plan fill:#ffffff,stroke:#7b8892,stroke-dasharray:5 4,color:#56646f
     class D,F text
-    class E,G img
-    class Q,K,I,N,S,X plan
+    class E,G,Q,K,I img
+    class N,S,X plan
 ```
 
 </details>
@@ -107,9 +110,9 @@ flowchart TD
 1. **Hash check.** Each PDF gets a SHA-256 fingerprint. If that exact file was already parsed in this run and its JSON still exists, it is skipped. The hash identifies the file; the "Updated as of" date identifies the edition.
 2. **Docling convert.** One converter per run. `generate_parsed_pages=True` and `include_bitmap_images=True` keep the list of images stored in the PDF, with their pixels. A PDF that fails is recorded with its error and the run continues.
 3. **Text check.** Every word Docling kept (text, list markers, table cells, headers and footers) is compared with the PDF's text layer, read separately with pypdfium2. Gives a percentage and flags pages where more than 5% (and at least 3 words) are missing. Text inside images is not in the text layer, so it is not counted.
-4. **Image detection.** For each image stored in the PDF: page, position, share of the page, pixel size, and page type (`image_only` if the image covers more than 30% of the page and the page has fewer than 30 body words, otherwise `mixed`). Each image is saved as a PNG.
-5. **Picture labels.** Docling's layout model also marks areas that look like pictures. A picture that sits inside a stored image is labelled `embedded image`; anything else is labelled `drawn picture`.
-6. **OCR quality check and Gemini (planned).** With OCR on, each image's OCR text would be checked (confidence of at least 0.95 plus a real-word check). Good text is kept and moved out of the picture; poor text goes to Gemini with a human check. `read_image_with_gemini()` is an empty placeholder for that step.
+4. **Image detection.** For each image stored in the PDF: page, position, share of the page, pixel size, and page type (`image_only` if the image covers more than 30% of the page and the page's own text layer has fewer than 30 words, otherwise `mixed`; OCR text is not counted). Each image is saved as a PNG.
+5. **Picture labels.** Docling's layout model also marks areas that look like pictures. A picture that sits inside a stored image is labelled `embedded image`; anything else is labelled `picture not matched` (no stored image under it: it may be drawn, or span several stored images).
+6. **OCR quality check and Gemini.** With OCR on, the OCR lines inside each stored image are collected and checked: average confidence of at least 0.95 (`CONFIDENCE_MIN`), and at least 95% real words (`REAL_WORD_MIN`; a word counts as real if it is common English according to `wordfreq`, or appears in the PDF's own text layer, so names and acronyms are not penalised). If both checks pass, the OCR text is kept. If either fails and `USE_GEMINI = True`, the image is sent to Gemini with a general prompt (copy text exactly, keep structure, make every line self-contained); the request is retried when Gemini is busy (503). Images smaller than 2% of the page are not read. The text is saved as a `.txt` file per image, and `report.json` records the confidence, real-word share, check result, source (`ocr` or `gemini`) and status. Moving this text into the document for chunking is not done yet.
 7. **Outputs.** Written to the run folder (see above).
 
 ### Settings
@@ -118,6 +121,8 @@ flowchart TD
 |---|---|---|
 | PDF backend | docling-parse (default) | The only backend that returns stored images (`bitmap_resources`). The pypdfium2 backend returned none. |
 | OCR | off in this pipeline (Docling's own default is on); `DO_OCR = True` uses ocrmac | The test PDFs have a text layer. OCR is only needed for text inside images. ocrmac is Apple's OCR and runs on macOS only. |
+| OCR checks | confidence ≥ 0.95 and ≥ 95% real words | On the test images, good OCR scored 1.00 / 0.97 and garbage scored 0.63–0.86 / 0.74–0.89 |
+| Gemini | off by default; `USE_GEMINI = True`, model `gemini-3.5-flash-lite` | Only for images that fail the OCR checks. Free Flash model; retries on 503 |
 | Table structure | on, `ACCURATE` | Docling default |
 | `generate_parsed_pages` | `True` | Keeps the stored-image list after parsing |
 | `include_bitmap_images` | `True` | Decodes the stored images' pixels, not just their positions |
@@ -136,7 +141,7 @@ flowchart TD
 | Images stored in the PDF | 3 | 3 |
 | p. 6 | mixed, 1378×903 px, 27% of page | mixed, 1378×903 px, 27% of page |
 | pp. 7–8 | image-only, 1831×1294 px, 51% of page | image-only, 1831×1294 px, 51% of page |
-| Layout-model pictures | 12 (8 embedded, 4 drawn) | 7 (3 embedded, 4 drawn) |
+| Layout-model pictures | 12 (8 embedded, 4 not matched: the cover logos) | 7 (3 embedded, 4 not matched: the cover logos) |
 | Updated as of | 2025-01-22 | 2026-05-13 (cover); footers say 2026-01-10 |
 
 ### With OCR on (run `pipeline_v2_ocrmac`, ocrmac)
@@ -170,6 +175,15 @@ flowchart TD
 | Logos | 0.90–0.91 (real logo text 1.00, junk lines 0.30) |
 | Dense, table-like image (academic calendar) | 0.63–0.86 |
 
+### Gemini on the stored images (`Gemini_ocr_test.py`, 16 Oct 2026)
+
+Model `gemini-3.5-flash-lite` (free tier). `gemini-3.8-flash` returned 503 "high demand" at the time.
+
+| Image | Simple prompt ("copy the text exactly") | General prompt with "self-contained lines" rule |
+|---|---|---|
+| Text-based image (Graduate Attributes) | All headings and bullets, matching the ocrmac text word for word | Same, with each bullet prefixed by its heading |
+| Dense, table-like image (academic calendar) | Events readable, but the table structure was broken | Every entry with its full date and weekday (spot-checked correct) and week label attached; still lists empty days |
+
 ## Findings
 
 **Docling can tell which images are stored in the PDF.** Read from the file (`bitmap_resources`, or the native pipeline), it finds exactly 3 stored images per edition on pp. 6, 7 and 8, with the same pages and pixel sizes as `pdfimages`. This does not depend on any AI model.
@@ -194,18 +208,18 @@ flowchart TD
 
 **Backends are almost equal on text.** docling-parse and pypdfium2 both read 99.89% of the 2025 text layer. On 2026, pypdfium2 does slightly better (99.77% vs 99.55%) because docling-parse splits more superscripts (`10th` → `10` + `th`). docling-parse is still used because it is the only one that returns stored images.
 
+**Gemini reads what OCR cannot, but the prompt matters.** On the text-based image, Gemini's output matched OCR word for word. On the dense calendar, where OCR produced garbage, Gemini read the events correctly. With a plain prompt it lost which month each entry belonged to; asking for every line to be self-contained (full date, row and column headings) fixed that without a calendar-specific prompt. The small Flash-Lite model still ignored "skip empty cells". The problem is complex layouts (grids, multi-column tables), not the image type.
+
 ## Known gaps
 
 - Image-only pages (the academic calendar, pp. 7–8) are not handled. They are detected and recorded as a known gap.
 - OCR text from images is stored inside the picture and does not reach the chunks yet.
 - ocrmac only runs on macOS. OCR on Linux (for docling-serve on the server) is untested; RapidOCR crashed on macOS.
-- With OCR on, the image-only rule counts OCR text as page text, so pp. 7–8 can be wrongly labelled `mixed`. The rule should count only the PDF's own text layer.
 - Graphics drawn with lines and shapes are not stored images, so they are not detected as embedded images. Their text labels are usually still extracted as normal text.
-- Running the script again with nothing new overwrites `report.json` with "skipped" entries. The full results stay in `manifest.json`.
-- If a PDF is replaced by a changed file with the same name, the old hash stays in `manifest.json` and points to the new output. Restoring the old file would then be wrongly skipped. To be fixed.
-- A picture is labelled `drawn picture` whenever it does not match a stored image. That does not prove it is drawn (for example, a picture spanning two stored images). It should be labelled "not matched" instead. To be fixed.
-- Setting `PAGE_RANGE` beyond the last page makes the text check fail. To be fixed.
-- `p6_readers.py` expects `data/parsed/` to exist; run `pipeline.py` once first.
+- The OCR checks and Gemini step in `pipeline.py` have not yet been run end to end on the test PDFs; the Gemini results above come from `Gemini_ocr_test.py`.
+- The OCR check cut-offs (0.95 / 0.95) are based on two sample PDFs only.
+- Gemini output on complex layouts still needs automatic checks (for example, that each stated weekday matches its date, or that OCR and Gemini agree where both read an image).
+- The Gemini API is not available in every region, and the free tier may be busy (503).
 
 ## Notes for docling-serve (n8n)
 
@@ -215,11 +229,10 @@ flowchart TD
 
 ## Next steps
 
-- Test an OCR engine on Linux, where docling-serve will run.
-- Add a real-word check next to OCR confidence, and record confidence per image in `report.json`.
-- Route only images that fail these checks to Gemini, with a human check.
-- Try Gemini on the stored p. 6 image and compare it with the OCR text, as a comparison and as the fallback where OCR is not available.
-- Fix the image-only rule so it counts only the PDF's own text layer.
+- Run `pipeline.py` with `DO_OCR = True` and `USE_GEMINI = True` and check the per-image results in `report.json`.
+- Test an OCR engine on Linux, where docling-serve will run (for example docling-serve in Docker).
+- Test the general Gemini prompt on other kinds of images (charts, scanned tables, diagrams, forms) from other PDFs.
+- Add automatic checks on Gemini output (dates and weekdays, agreement with OCR) so no human check is needed except for flagged cases.
 - Decide whether "embedded images" means every stored image or only ones that carry information.
 - Decide which date counts as an edition's version (cover or footer).
 - Chunking: move OCR text out of the picture (preferred: copy it into the picture's description, only for mixed pages, so calendar and logo junk stay out), and handle Gemini's 2,048-token embedding limit.

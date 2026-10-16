@@ -85,6 +85,7 @@ def descriptions(doc):
     return " ".join(p.meta.description.text for p in doc.pictures if p.meta and p.meta.description)
 
 
+OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 lines = []
 for name, options in TESTS.items():
     converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
